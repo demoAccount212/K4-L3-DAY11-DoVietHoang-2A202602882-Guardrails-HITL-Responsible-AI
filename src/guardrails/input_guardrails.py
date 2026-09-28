@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -52,13 +53,35 @@ def detect_injection(user_input: str) -> InputStatus:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        # 1) ignore / disregard / forget previous (or bare) instructions
+        r"\bignore\s+(all\s+)?((previous|prior|above|earlier|older)\s+)?(all\s+)?(instructions|prompts?)\b",
+        r"\bdisregard\s+(all\s+)?((previous|prior|above|your)\s+)?(instructions|prompts?|rules)\b",
+        r"\bforget\s+(all\s+)?(previous|above|your)\s+(instructions|prompts?)\b",
+        # 2) role/persona override
+        r"\byou\s+are\s+now\b",
+        r"\bact\s+as\s+(a\s+|an\s+)?(unrestricted|jailbroken|unfiltered|dan)\b",
+        r"\bpretend\s+(you\s+are|you'?re|to\s+be)\b",
+        # 3) system-prompt exfiltration
+        r"\bsystem\s+prompt\b",
+        r"\b(reveal|show|print|leak|expose|display)\s+(your|the|hidden|internal)\s+(system\s+)?(prompt|instructions?)\b",
+        # 4) safety / policy override
+        r"\boverride\s+(your|the|all|these)\s+(safety|rules|instructions|guidelines)\b",
+        r"\bwithout\s+(any\s+)?(restrictions|limitations|filters|rules)\b",
+        # 5) mode / new-instruction smuggling
+        r"\b(developer|god|sudo|dan|admin)\s+mode\b",
+        r"\bnew\s+instructions\s*:",
     ]
 
+    # Strip zero-width / invisible characters (e.g. "Ignore\u200b all previous
+    # instructions") and normalize full-width forms before matching.
+    normalized = re.sub(
+        "[\u200b\u200c\u200d\u2060\ufeff\u00ad\u200e\u200f]", "", user_input
+    )
+    normalized = unicodedata.normalize("NFKC", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -86,12 +109,16 @@ def topic_filter(user_input: str) -> InputStatus:
     """
     input_lower = user_input.lower()
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # 1. Blocked topic (hack, weapon, ...) -> always BLOCK.
+    if any(topic in input_lower for topic in BLOCKED_TOPICS):
+        return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. No banking topic at all (cooking, weather, ...) -> BLOCK.
+    if not any(topic in input_lower for topic in ALLOWED_TOPICS):
+        return "BLOCK"
+
+    # 3. Banking-related -> ALLOW.
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +171,26 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # 1. Injection / jailbreak attempts are blocked first.
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "[BLOCKED] Your request contains instructions that override my "
+                "guidelines, so I cannot continue. Please ask a normal banking "
+                "question instead."
+            )
 
-        pass  # Replace with your implementation
+        # 2. Off-topic or disallowed topics never reach the LLM.
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "[BLOCKED] I only answer VinBank banking questions "
+                "(accounts, transfers, loans, savings, cards). Please rephrase "
+                "your banking question."
+            )
+
+        # 3. Both checks passed -> let the message through.
+        return None
 
 
 # ============================================================
